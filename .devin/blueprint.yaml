@@ -1,0 +1,74 @@
+# Event blueprint: only the toolchains the workshop acts touch.
+# Act 2: api-gateway (Go) + notification-service (Kotlin/Gradle, JDK 17)
+# Act 3: search-service, document-service (Python 3.12), collab-service (Node 20),
+#        api-gateway (Go 1.22), audit-service (.NET 8)
+initialize: |
+  set -e
+  if ! /usr/local/go/bin/go version 2>/dev/null | grep -q go1.22; then
+    curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz -o /tmp/go.tgz
+    sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+  fi
+  echo "PATH=/usr/local/go/bin:$HOME/go/bin:$PATH" >> $ENVRC
+
+  curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+  bash /tmp/dotnet-install.sh --channel 8.0 --install-dir "$HOME/.dotnet"
+  echo "DOTNET_ROOT=$HOME/.dotnet" >> $ENVRC
+  echo "PATH=$HOME/.dotnet:$PATH" >> $ENVRC
+
+  sudo apt-get update -y && sudo apt-get install -y openjdk-17-jdk-headless unzip
+  echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $ENVRC
+  if [ ! -x /opt/gradle-8.6/bin/gradle ]; then
+    curl -fsSL https://services.gradle.org/distributions/gradle-8.6-bin.zip -o /tmp/gradle.zip
+    sudo unzip -q -o /tmp/gradle.zip -d /opt && rm /tmp/gradle.zip
+  fi
+  echo "PATH=/opt/gradle-8.6/bin:$PATH" >> $ENVRC
+
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] || curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+  . "$NVM_DIR/nvm.sh" && nvm install 20 && nvm alias default 20
+
+  python3.12 --version
+  python3.12 -m pip install --user --upgrade poetry
+  mkdir -p ~/.gradle/init.d
+  cat > ~/.gradle/init.d/maven-mirror.gradle <<'GRADLE'
+  def mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+  settingsEvaluated { s -> s.pluginManagement.repositories { maven { url mirror }; gradlePluginPortal() } }
+  allprojects { buildscript.repositories { maven { url mirror } }; repositories { maven { url mirror } } }
+  GRADLE
+
+maintenance: |
+  export PATH="/usr/local/go/bin:$HOME/.dotnet:/opt/gradle-8.6/bin:$HOME/.local/bin:$PATH"
+  export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 DOTNET_ROOT="$HOME/.dotnet"
+  export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
+  (cd services/search-service && python3.12 -m venv .venv && .venv/bin/pip install -q -r requirements-dev.txt)
+  (cd services/document-service && poetry config virtualenvs.in-project true && poetry install --no-root --no-interaction)
+  (cd services/collab-service && npm ci --no-audit --no-fund)
+  (cd services/api-gateway && go mod download)
+  (cd services/audit-service && dotnet restore tests/AuditService.Tests)
+  (cd services/notification-service && gradle --no-daemon -q dependencies > /dev/null) || echo "notification-service dependency warm-up skipped; gradle resolves on first test run"
+
+knowledge:
+  - name: run a service's own tests
+    contents: |
+      Run the tests of the service you changed, from the repo root:
+        search-service:       cd services/search-service && .venv/bin/pytest
+        document-service:     cd services/document-service && poetry run pytest
+        collab-service:       cd services/collab-service && npm test
+        api-gateway:          cd services/api-gateway && go test ./...
+        audit-service:        cd services/audit-service && dotnet test tests/AuditService.Tests
+        notification-service: cd services/notification-service && gradle --no-daemon test
+      notification-service has no Gradle wrapper; use the gradle 8.6 on PATH with JDK 17.
+  - name: what this repo is
+    contents: |
+      Event copy of OtterWorks for a hands-on workshop. GitHub Actions are removed on
+      purpose, so there is no CI on pull requests: the tests you run in the session are
+      the evidence. Nothing here deploys to AWS; do not try to reach live infrastructure.
+  - name: pull request description format
+    contents: |
+      Every pull request in this repo uses these four sections, in this order:
+        ## What changed   (two or three plain sentences a non-engineer can follow)
+        ## Why            (the ticket, alert or finding, with its id)
+        ## How to verify  (the exact commands you ran and their result lines)
+        ## Risk           (what could break and how to roll back)
+      Keep the title under 70 characters and start it with the service name.
+      When a follow-up asks for another section, add it inside these four.
